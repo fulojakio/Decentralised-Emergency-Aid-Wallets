@@ -308,3 +308,252 @@
         none
     )
 )
+
+;; === Emergency Alert System ===
+
+;; Additional error constants for alert system
+(define-constant err-alert-not-found (err u200))
+(define-constant err-alert-already-resolved (err u201))
+(define-constant err-invalid-priority (err u202))
+(define-constant err-invalid-location (err u203))
+
+;; Alert system data variables
+(define-data-var next-alert-id uint u1)
+(define-data-var total-alerts-created uint u0)
+(define-data-var active-alerts-count uint u0)
+
+;; Emergency alert data map
+(define-map emergency-alerts
+    { alert-id: uint }
+    {
+        creator: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        location: (string-ascii 200),
+        emergency-type: (string-ascii 50),
+        priority: uint, ;; 1=Low, 2=Medium, 3=High, 4=Critical
+        created-at: uint,
+        is-active: bool,
+        resolved-at: (optional uint),
+        resolved-by: (optional principal),
+        contact-info: (optional (string-ascii 100)),
+    }
+)
+
+;; Alert response tracking
+(define-map alert-responses
+    {
+        alert-id: uint,
+        responder: principal,
+    }
+    {
+        response-type: (string-ascii 50), ;; "acknowledged", "helping", "resolved"
+        message: (string-ascii 200),
+        timestamp: uint,
+    }
+)
+
+;; User alert statistics
+(define-map user-alert-stats
+    { user: principal }
+    {
+        alerts-created: uint,
+        alerts-resolved: uint,
+        responses-made: uint,
+        last-activity: uint,
+    }
+)
+
+;; Create emergency alert
+(define-public (create-emergency-alert
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (location (string-ascii 200))
+        (emergency-type (string-ascii 50))
+        (priority uint)
+        (contact-info (optional (string-ascii 100)))
+    )
+    (let (
+            (alert-id (var-get next-alert-id))
+            (user-stats (default-to {
+                alerts-created: u0,
+                alerts-resolved: u0,
+                responses-made: u0,
+                last-activity: u0,
+            }
+                (map-get? user-alert-stats { user: tx-sender })
+            ))
+        )
+        ;; Validate inputs
+        (asserts! (and (>= priority u1) (<= priority u4)) err-invalid-priority)
+        (asserts! (> (len title) u0) err-invalid-amount)
+        (asserts! (> (len description) u0) err-invalid-amount)
+        (asserts! (> (len location) u0) err-invalid-location)
+
+        ;; Create the alert
+        (map-set emergency-alerts { alert-id: alert-id } {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            location: location,
+            emergency-type: emergency-type,
+            priority: priority,
+            created-at: stacks-block-height,
+            is-active: true,
+            resolved-at: none,
+            resolved-by: none,
+            contact-info: contact-info,
+        })
+
+        ;; Update statistics
+        (map-set user-alert-stats { user: tx-sender }
+            (merge user-stats {
+                alerts-created: (+ (get alerts-created user-stats) u1),
+                last-activity: stacks-block-height,
+            })
+        )
+
+        ;; Update global counters
+        (var-set next-alert-id (+ alert-id u1))
+        (var-set total-alerts-created (+ (var-get total-alerts-created) u1))
+        (var-set active-alerts-count (+ (var-get active-alerts-count) u1))
+
+        (ok alert-id)
+    )
+)
+
+;; Respond to an emergency alert
+(define-public (respond-to-alert
+        (alert-id uint)
+        (response-type (string-ascii 50))
+        (message (string-ascii 200))
+    )
+    (let (
+            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id }) err-alert-not-found))
+            (user-stats (default-to {
+                alerts-created: u0,
+                alerts-resolved: u0,
+                responses-made: u0,
+                last-activity: u0,
+            }
+                (map-get? user-alert-stats { user: tx-sender })
+            ))
+        )
+        ;; Validate alert is active
+        (asserts! (get is-active alert) err-alert-already-resolved)
+        
+        ;; Prevent self-response
+        (asserts! (not (is-eq tx-sender (get creator alert))) err-self-approval)
+
+        ;; Record the response
+        (map-set alert-responses {
+            alert-id: alert-id,
+            responder: tx-sender,
+        } {
+            response-type: response-type,
+            message: message,
+            timestamp: stacks-block-height,
+        })
+
+        ;; Update user statistics
+        (map-set user-alert-stats { user: tx-sender }
+            (merge user-stats {
+                responses-made: (+ (get responses-made user-stats) u1),
+                last-activity: stacks-block-height,
+            })
+        )
+
+        (ok true)
+    )
+)
+
+;; Resolve an emergency alert
+(define-public (resolve-alert (alert-id uint))
+    (let (
+            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id }) err-alert-not-found))
+            (creator-stats (default-to {
+                alerts-created: u0,
+                alerts-resolved: u0,
+                responses-made: u0,
+                last-activity: u0,
+            }
+                (map-get? user-alert-stats { user: (get creator alert) })
+            ))
+        )
+        ;; Only creator can resolve their alert
+        (asserts! (is-eq tx-sender (get creator alert)) err-owner-only)
+        (asserts! (get is-active alert) err-alert-already-resolved)
+
+        ;; Mark alert as resolved
+        (map-set emergency-alerts { alert-id: alert-id }
+            (merge alert {
+                is-active: false,
+                resolved-at: (some stacks-block-height),
+                resolved-by: (some tx-sender),
+            })
+        )
+
+        ;; Update creator statistics
+        (map-set user-alert-stats { user: (get creator alert) }
+            (merge creator-stats {
+                alerts-resolved: (+ (get alerts-resolved creator-stats) u1),
+                last-activity: stacks-block-height,
+            })
+        )
+
+        ;; Update global counter
+        (var-set active-alerts-count (- (var-get active-alerts-count) u1))
+
+        (ok true)
+    )
+)
+
+;; Read-only functions for alert system
+
+(define-read-only (get-emergency-alert (alert-id uint))
+    (map-get? emergency-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-alert-response
+        (alert-id uint)
+        (responder principal)
+    )
+    (map-get? alert-responses {
+        alert-id: alert-id,
+        responder: responder,
+    })
+)
+
+(define-read-only (get-user-alert-stats (user principal))
+    (map-get? user-alert-stats { user: user })
+)
+
+(define-read-only (get-alert-system-stats)
+    {
+        total-alerts-created: (var-get total-alerts-created),
+        active-alerts-count: (var-get active-alerts-count),
+        next-alert-id: (var-get next-alert-id),
+        resolved-alerts-count: (- (var-get total-alerts-created) (var-get active-alerts-count)),
+    }
+)
+
+(define-read-only (is-alert-active (alert-id uint))
+    (match (map-get? emergency-alerts { alert-id: alert-id })
+        alert (get is-active alert)
+        false
+    )
+)
+
+(define-read-only (get-alert-priority-level (alert-id uint))
+    (match (map-get? emergency-alerts { alert-id: alert-id })
+        alert (some (get priority alert))
+        none
+    )
+)
+
+(define-read-only (get-alerts-by-priority (min-priority uint))
+    (if (and (>= min-priority u1) (<= min-priority u4))
+        (ok min-priority) ;; In a full implementation, this would filter alerts
+        err-invalid-priority
+    )
+)
