@@ -8,10 +8,14 @@
 (define-constant err-already-approved (err u106))
 (define-constant err-expired (err u107))
 (define-constant err-self-approval (err u108))
+(define-constant err-not-eligible (err u109))
+(define-constant err-no-donation (err u110))
+(define-constant err-already-refunded (err u111))
 
 (define-data-var next-aid-id uint u1)
 (define-data-var total-donations uint u0)
 (define-data-var total-distributed uint u0)
+(define-data-var total-refunded uint u0)
 
 (define-map aid-requests
     { aid-id: uint }
@@ -25,6 +29,7 @@
         is-approved: bool,
         is-active: bool,
         approved-by: (optional principal),
+        was-withdrawn: bool,
     }
 )
 
@@ -62,6 +67,17 @@
     }
     {
         approved: bool,
+        timestamp: uint,
+    }
+)
+
+(define-map refund-claims
+    {
+        donor: principal,
+        aid-id: uint,
+    }
+    {
+        claimed: bool,
         timestamp: uint,
     }
 )
@@ -111,6 +127,7 @@
             is-approved: false,
             is-active: true,
             approved-by: none,
+            was-withdrawn: false,
         })
 
         (var-set next-aid-id (+ aid-id u1))
@@ -219,7 +236,10 @@
         (try! (as-contract (stx-transfer? amount-to-withdraw tx-sender (get requester aid-request))))
 
         (map-set aid-requests { aid-id: aid-id }
-            (merge aid-request { is-active: false })
+            (merge aid-request {
+                is-active: false,
+                was-withdrawn: true,
+            })
         )
 
         (var-set total-distributed
@@ -429,7 +449,9 @@
         (message (string-ascii 200))
     )
     (let (
-            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id }) err-alert-not-found))
+            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id })
+                err-alert-not-found
+            ))
             (user-stats (default-to {
                 alerts-created: u0,
                 alerts-resolved: u0,
@@ -441,7 +463,7 @@
         )
         ;; Validate alert is active
         (asserts! (get is-active alert) err-alert-already-resolved)
-        
+
         ;; Prevent self-response
         (asserts! (not (is-eq tx-sender (get creator alert))) err-self-approval)
 
@@ -470,7 +492,9 @@
 ;; Resolve an emergency alert
 (define-public (resolve-alert (alert-id uint))
     (let (
-            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id }) err-alert-not-found))
+            (alert (unwrap! (map-get? emergency-alerts { alert-id: alert-id })
+                err-alert-not-found
+            ))
             (creator-stats (default-to {
                 alerts-created: u0,
                 alerts-resolved: u0,
@@ -553,7 +577,98 @@
 
 (define-read-only (get-alerts-by-priority (min-priority uint))
     (if (and (>= min-priority u1) (<= min-priority u4))
-        (ok min-priority) ;; In a full implementation, this would filter alerts
+        (ok min-priority)
         err-invalid-priority
+    )
+)
+
+(define-read-only (is-refund-eligible
+        (donor principal)
+        (aid-id uint)
+    )
+    (let (
+            (aid-request (map-get? aid-requests { aid-id: aid-id }))
+            (donation (map-get? donations {
+                donor: donor,
+                aid-id: aid-id,
+            }))
+            (claim (default-to {
+                claimed: false,
+                timestamp: u0,
+            }
+                (map-get? refund-claims {
+                    donor: donor,
+                    aid-id: aid-id,
+                })
+            ))
+        )
+        (if (and
+                (is-some aid-request)
+                (is-some donation)
+                (not (get claimed claim))
+                (or
+                    (not (get is-approved (unwrap-panic aid-request)))
+                    (> stacks-block-height
+                        (get deadline (unwrap-panic aid-request))
+                    )
+                    (and
+                        (not (get is-active (unwrap-panic aid-request)))
+                        (not (get was-withdrawn (unwrap-panic aid-request)))
+                    )
+                )
+            )
+            true
+            false
+        )
+    )
+)
+
+(define-public (claim-refund (aid-id uint))
+    (let (
+            (aid-request (unwrap! (map-get? aid-requests { aid-id: aid-id }) err-not-found))
+            (donation (unwrap!
+                (map-get? donations {
+                    donor: tx-sender,
+                    aid-id: aid-id,
+                })
+                err-no-donation
+            ))
+            (prev-claim (default-to {
+                claimed: false,
+                timestamp: u0,
+            }
+                (map-get? refund-claims {
+                    donor: tx-sender,
+                    aid-id: aid-id,
+                })
+            ))
+            (donor tx-sender)
+            (amount (get amount donation))
+        )
+        (asserts! (not (get claimed prev-claim)) err-already-refunded)
+        (asserts!
+            (or
+                (not (get is-approved aid-request))
+                (> stacks-block-height (get deadline aid-request))
+                (and
+                    (not (get is-active aid-request))
+                    (not (get was-withdrawn aid-request))
+                )
+            )
+            err-not-eligible
+        )
+        (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount)
+            err-insufficient-funds
+        )
+        (try! (as-contract (stx-transfer? amount tx-sender donor)))
+        (map-set refund-claims {
+            donor: donor,
+            aid-id: aid-id,
+        } {
+            claimed: true,
+            timestamp: stacks-block-height,
+        })
+        (var-set total-refunded (+ (var-get total-refunded) amount))
+        (ok amount)
     )
 )
